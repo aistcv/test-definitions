@@ -6,6 +6,9 @@ set -x
 . ../../lib/sh-test-lib
 OUTPUT="$(pwd)/output"
 RESULT_FILE="${OUTPUT}/result.txt"
+# Initialize before argument handling can fail, so LAVA never sends old results.
+create_out_dir "${OUTPUT}"
+: > "${RESULT_FILE}" || error_msg "Cannot initialize ${RESULT_FILE}"
 # Absolute path to this script. /home/user/bin/foo.sh
 SCRIPT="$(readlink -f "${0}")"
 # Absolute path this script is in. /home/user/bin
@@ -180,48 +183,146 @@ parse_ltp_json_results() {
     done
 }
 
+# Report wrapper failures separately from individual LTP test failures.
+ltp_error() {
+    local test_case="$1"
+    local message="$2"
+    printf '%s\n' "${message}" | tee -a "${OUTPUT}/${test_case}.log" >&2
+    report_fail "${test_case}"
+    return 1
+}
+
+prepare_ltp_shard() {
+    local file
+    local -a suites
+
+    if ! [[ "${SHARD_NUMBER}" =~ ^[1-9][0-9]*$ ]] \
+        || ! [[ "${SHARD_INDEX}" =~ ^[1-9][0-9]*$ ]] \
+        || ! [ "${SHARD_INDEX}" -le "${SHARD_NUMBER}" ]; then
+        ltp_error ltp-setup "Shard index and count must be positive integers, with index <= count."
+        return 1
+    fi
+    case "${TST_CMDFILES}" in
+        ""|,*|*,|*,,*)
+            ltp_error ltp-setup "TST_CMDFILES must contain a comma-separated list of suite names."
+            return 1
+            ;;
+    esac
+    # Preserve comma/whitespace-separated selections without pathname expansion.
+    read -r -d '' -a suites <<< "${TST_CMDFILES//,/ }" || true
+
+    # Keep a fresh manifest with the output, even after an interrupted run.
+    : > "${OUTPUT}/alltests" || return 1
+    for file in "${suites[@]}"; do
+        if ! [[ "${file}" =~ ^[A-Za-z0-9_.-]+$ ]] \
+            || [ ! -f "runtest/${file}" ] || [ ! -r "runtest/${file}" ]; then
+            ltp_error ltp-setup "Cannot read requested suite runtest/${file}."
+            return 1
+        fi
+        # awk terminates each record even if a source lacks its final newline.
+        if ! awk '{ sub(/#.*/, ""); if ($0 ~ /[^[:space:]]/) print }' \
+            "runtest/${file}" >> "${OUTPUT}/alltests"; then
+            ltp_error ltp-setup "Cannot prepare requested suite ${file}."
+            return 1
+        fi
+    done
+    if [ ! -s "${OUTPUT}/alltests" ]; then
+        ltp_error ltp-setup "The requested suites contain no tests."
+        return 1
+    fi
+    if ! split -n "l/${SHARD_INDEX}/${SHARD_NUMBER}" "${OUTPUT}/alltests" > "${OUTPUT}/shardfile" \
+        || ! cp "${OUTPUT}/shardfile" runtest/shardfile; then
+        ltp_error ltp-setup "Could not create the requested shard."
+        return 1
+    fi
+    info_msg "LTP manifest checksums (SHA-256):"
+    sha256sum "${OUTPUT}/alltests" "${OUTPUT}/shardfile" || return 1
+    info_msg "LTP shard ${SHARD_INDEX}/${SHARD_NUMBER}: $(wc -l < "${OUTPUT}/shardfile") of $(wc -l < "${OUTPUT}/alltests") test entries (before exclusions)."
+    echo "============== Tests to run ==============="
+    cat "${OUTPUT}/shardfile"
+    echo "===========End Tests to run ==============="
+}
+
 # Run LTP test suite
 run_ltp() {
-    # shellcheck disable=SC2164
-    cd "${LTP_INSTALL_PATH}"
+    if ! cd "${LTP_INSTALL_PATH}"; then
+        ltp_error ltp-setup "Cannot enter LTP installation ${LTP_INSTALL_PATH}."
+        return 1
+    fi
+    prepare_ltp_shard || return 1
+    # GNU split can produce empty shards when there are few or uneven lines.
+    if [ ! -s "${OUTPUT}/shardfile" ]; then
+        info_msg "The requested shard contains no tests; Kirk will not be run."
+        report_skip ltp-shard
+        return 0
+    fi
     # shellcheck disable=SC2174
-    mkdir -m 777 -p "${LTP_TMPDIR}"
-
-    for file in ${TST_CMDFILES//,/ }; do
-      cat runtest/"${file}" >>alltests
-    done
-    sed -i 's/#.*$//;/^$/d' alltests
-    split --verbose --numeric-suffixes=1 -n l/"${SHARD_INDEX}"/"${SHARD_NUMBER}" alltests >runtest/shardfile
-    echo "============== Tests to run ==============="
-    cat runtest/shardfile
-    echo "===========End Tests to run ==============="
+    if ! mkdir -m 777 -p "${LTP_TMPDIR}"; then
+        ltp_error ltp-setup "Cannot create LTP temporary directory ${LTP_TMPDIR}."
+        return 1
+    fi
 
     local kirk_bin
-    kirk_bin="$(command -v "${KIRK_PATH}")" \
-        || error_msg "${KIRK_PATH} is not installed into the file system."
+    if ! kirk_bin="$(command -v "${KIRK_PATH}")"; then
+        ltp_error ltp-runner "${KIRK_PATH} is not installed into the file system."
+        return 1
+    fi
     KIRK_PATH="${kirk_bin}"
 
     if ! "${KIRK_PATH}" --version; then
-      error_msg "${KIRK_PATH} does not run."
+        ltp_error ltp-runner "${KIRK_PATH} does not run."
+        return 1
     fi
     if [ "${KIRK_WORKERS}" = "max" ]; then
-      KIRK_WORKERS=$(grep ^processor /proc/cpuinfo | wc -l)
+        KIRK_WORKERS=$(grep ^processor /proc/cpuinfo | wc -l)
     fi
-    export LTP_COLORIZE_OUTPUT=0
-    pipe0_status "${KIRK_PATH} ${EXTRA_KIRK_ARGS} --run-suite shardfile \
-                            -d ${LTP_TMPDIR} \
-                            ${SKIPFILE_PATH:+--skip-file} ${SKIPFILE_PATH} \
-                            ${KIRK_WORKERS:+--workers} ${KIRK_WORKERS} \
-                            --no-colors \
-                            --json-report /tmp/kirk-report.json" \
-                            "tee ${OUTPUT}/LTP_${LOG_FILE}.out"
-    parse_ltp_json_results "/tmp/kirk-report.json"
-    rm "/tmp/kirk-report.json"
 
-    # Cleanup
-    # don't fail the whole test job if rm fails
+    # Kirk refuses to overwrite reports. Never parse an earlier run's report.
+    local report="${OUTPUT}/kirk-report.json"
+    if ! rm -f "${report}"; then
+        ltp_error ltp-report "Cannot remove the previous Kirk report."
+        return 1
+    fi
+    local -a kirk_args=(--run-suite shardfile -d "${LTP_TMPDIR}")
+    if [ -n "${SKIPFILE_PATH}" ]; then
+        kirk_args+=(--skip-file "${SKIPFILE_PATH}")
+    fi
+    if [ -n "${KIRK_WORKERS}" ]; then
+        kirk_args+=(--workers "${KIRK_WORKERS}")
+    fi
+    kirk_args+=(--no-colors --json-report "${report}")
+
+    # pipe0_status evaluates shell commands; quote paths while retaining the
+    # existing shell-argument interface for EXTRA_KIRK_ARGS.
+    local kirk_command kirk_options log_command
+    printf -v kirk_command '%q ' "${KIRK_PATH}"
+    printf -v kirk_options '%q ' "${kirk_args[@]}"
+    printf -v log_command 'tee -- %q' "${OUTPUT}/LTP_${LOG_FILE}.out"
+    local runner_status=0
+    local status=0
+    export LTP_COLORIZE_OUTPUT=0
+    pipe0_status "${kirk_command}${EXTRA_KIRK_ARGS} ${kirk_options}" \
+        "${log_command}" || runner_status=$?
+    if [ "${runner_status}" -ne 0 ]; then
+        ltp_error ltp-runner "Kirk exited with status ${runner_status}; checking for partial results."
+        status=1
+    fi
+
+    # Parse even after a runner error, and retain the original report for
+    # diagnosis. Ordinary LTP fail/brok/conf results do not fail the wrapper.
+    # Keep per-test parsing unchanged; require a nonempty results array first.
+    if ! {
+        jq -e '.results | type == "array" and length > 0' "${report}" > /dev/null &&
+            parse_ltp_json_results "${report}"
+    } 2> "${OUTPUT}/ltp-report.log"; then
+        cat "${OUTPUT}/ltp-report.log" >&2
+        ltp_error ltp-report "Kirk did not produce a usable report."
+        status=1
+    fi
+
+    # Cleanup must not hide a runner or report failure.
     rm -rf "${LTP_TMPDIR}" || true
-    rm -rf alltests || true
+    return "${status}"
 }
 
 # Prepare system
@@ -294,7 +395,6 @@ install() {
 
 # Test run.
 ! check_root && error_msg "This script must be run as root"
-create_out_dir "${OUTPUT}"
 
 info_msg "About to run ltp test..."
 info_msg "Output directory: ${OUTPUT}"
